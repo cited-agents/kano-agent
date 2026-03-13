@@ -1,0 +1,273 @@
+name: Test Agent (Sandbox)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Source repository (owner/repo)"
+        required: true
+        type: string
+      commit_sha:
+        description: "Pinned commit SHA"
+        required: true
+        type: string
+      package_name:
+        description: "Package name (e.g. dfmea-agent)"
+        required: true
+        type: string
+      entrypoint:
+        description: "Agent entrypoint (e.g. src/main.py)"
+        required: true
+        type: string
+      dependencies:
+        description: 'JSON array of Python dependencies'
+        required: false
+        default: "[]"
+        type: string
+      examples:
+        description: 'JSON array of example inputs [{label, input}]'
+        required: true
+        type: string
+      output_schema:
+        description: 'JSON Schema for validating agent output'
+        required: true
+        type: string
+      required_env:
+        description: 'Comma-separated list of required env var names'
+        required: false
+        default: ""
+        type: string
+      callback_url:
+        description: "Platform webhook URL to POST results to"
+        required: true
+        type: string
+      callback_token:
+        description: "HMAC token for authenticating the callback"
+        required: true
+        type: string
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    container:
+      image: python:3.12-slim
+      options: --memory=2g
+    steps:
+      - name: Checkout source at pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.source_repo }}
+          ref: ${{ inputs.commit_sha }}
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+
+          # Install from requirements.txt if it exists
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+          # Install explicit dependencies from workflow input
+          DEPS='${{ inputs.dependencies }}'
+          if [ "$DEPS" != "[]" ] && [ -n "$DEPS" ]; then
+            echo "$DEPS" | python3 -c "
+          import json, sys
+          deps = json.load(sys.stdin)
+          for d in deps:
+              print(d)
+          " | xargs pip install
+          fi
+
+          # Install jsonschema for output validation
+          pip install jsonschema
+
+      - name: Run examples and validate output
+        id: test
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        run: |
+          EXAMPLES='${{ inputs.examples }}'
+          OUTPUT_SCHEMA='${{ inputs.output_schema }}'
+          ENTRYPOINT='${{ inputs.entrypoint }}'
+
+          python3 << 'TEST_EOF'
+          import json, subprocess, sys, time, os
+
+          examples = json.loads(os.environ.get("EXAMPLES_JSON", '${{ inputs.examples }}'))
+          output_schema = json.loads(os.environ.get("SCHEMA_JSON", '${{ inputs.output_schema }}'))
+          entrypoint = "${{ inputs.entrypoint }}"
+
+          total = len(examples)
+          passed = 0
+          results = []
+
+          for i, ex in enumerate(examples):
+              label = ex.get("label", f"example-{i+1}")
+              inp = json.dumps(ex["input"])
+              print(f"\n--- Running example {i+1}/{total}: {label} ---")
+
+              start = time.time()
+              try:
+                  proc = subprocess.run(
+                      ["python", entrypoint],
+                      input=inp,
+                      capture_output=True,
+                      text=True,
+                      timeout=120,
+                  )
+                  duration = time.time() - start
+
+                  if proc.returncode != 0:
+                      results.append({
+                          "label": label,
+                          "status": "fail",
+                          "error": f"Exit code {proc.returncode}: {proc.stderr[:500]}",
+                          "duration_s": round(duration, 2),
+                      })
+                      print(f"  FAIL: exit code {proc.returncode}")
+                      if proc.stderr:
+                          print(f"  stderr: {proc.stderr[:300]}")
+                      continue
+
+                  # Parse and validate output
+                  try:
+                      output = json.loads(proc.stdout)
+                  except json.JSONDecodeError as e:
+                      results.append({
+                          "label": label,
+                          "status": "fail",
+                          "error": f"Invalid JSON output: {e}",
+                          "duration_s": round(duration, 2),
+                      })
+                      print(f"  FAIL: invalid JSON output")
+                      continue
+
+                  # Validate against output schema
+                  from jsonschema import validate, ValidationError
+                  try:
+                      validate(instance=output, schema=output_schema)
+                  except ValidationError as e:
+                      results.append({
+                          "label": label,
+                          "status": "fail",
+                          "error": f"Output schema mismatch: {e.message[:300]}",
+                          "duration_s": round(duration, 2),
+                      })
+                      print(f"  FAIL: output doesn't match schema")
+                      continue
+
+                  passed += 1
+                  results.append({
+                      "label": label,
+                      "status": "pass",
+                      "duration_s": round(duration, 2),
+                  })
+                  print(f"  PASS ({duration:.1f}s)")
+
+              except subprocess.TimeoutExpired:
+                  results.append({
+                      "label": label,
+                      "status": "fail",
+                      "error": "Timeout (120s)",
+                      "duration_s": 120,
+                  })
+                  print(f"  FAIL: timeout")
+              except Exception as e:
+                  results.append({
+                      "label": label,
+                      "status": "fail",
+                      "error": str(e)[:300],
+                      "duration_s": 0,
+                  })
+                  print(f"  FAIL: {e}")
+
+          summary = {
+              "examples_run": total,
+              "examples_passed": passed,
+              "all_passed": passed == total,
+              "results": results,
+          }
+
+          print(f"\n--- Summary: {passed}/{total} passed ---")
+
+          # Write outputs for next steps
+          with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
+              f.write(f"examples_run={total}\n")
+              f.write(f"examples_passed={passed}\n")
+              f.write(f"all_passed={'true' if passed == total else 'false'}\n")
+
+          # Write detailed results to file
+          with open("test-results.json", "w") as f:
+              json.dump(summary, f, indent=2)
+
+          if passed < total:
+              sys.exit(1)
+          TEST_EOF
+
+      - name: Callback on success
+        if: success()
+        run: |
+          RESULTS=$(cat test-results.json 2>/dev/null || echo '{}')
+          PAYLOAD=$(python3 -c "
+          import json
+          results = json.loads(open('test-results.json').read())
+          payload = {
+              'stage': 'testing',
+              'status': 'success',
+              'examples_run': results.get('examples_run', 0),
+              'examples_passed': results.get('examples_passed', 0),
+              'test_output': json.dumps(results.get('results', []))[:2000],
+          }
+          print(json.dumps(payload))
+          ")
+
+          curl -X POST "${{ inputs.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -H "X-SBA-Token: ${{ inputs.callback_token }}" \
+            -d "$PAYLOAD" \
+            --fail --silent --show-error \
+            --max-time 30
+
+      - name: Callback on failure
+        if: failure()
+        run: |
+          RESULTS=$(cat test-results.json 2>/dev/null || echo '{"results":[]}')
+          ERROR_MSG=$(python3 -c "
+          import json
+          try:
+              results = json.loads(open('test-results.json').read())
+              failed = [r for r in results.get('results', []) if r['status'] == 'fail']
+              errors = '; '.join(f\"{r['label']}: {r.get('error', 'unknown')}\" for r in failed[:3])
+              print(errors[:500])
+          except:
+              print('Test execution failed — check workflow logs')
+          " 2>/dev/null || echo 'Test execution failed')
+
+          PAYLOAD=$(python3 -c "
+          import json, sys
+          results = {}
+          try:
+              results = json.loads(open('test-results.json').read())
+          except:
+              pass
+          payload = {
+              'stage': 'testing',
+              'status': 'failed',
+              'examples_run': results.get('examples_run', 0),
+              'examples_passed': results.get('examples_passed', 0),
+              'test_output': json.dumps(results.get('results', []))[:2000],
+              'error': '$ERROR_MSG'[:500],
+          }
+          print(json.dumps(payload))
+          ")
+
+          curl -X POST "${{ inputs.callback_url }}" \
+            -H "Content-Type: application/json" \
+            -H "X-SBA-Token: ${{ inputs.callback_token }}" \
+            -d "$PAYLOAD" \
+            --fail --silent --show-error \
+            --max-time 30 || true
